@@ -1,0 +1,5 @@
+PyQt6
+qtawesome
+markdown
+firebase_admin
+PyQt6-WebEngine
