@@ -372,3 +372,36 @@ def set_user_role_firestore(login: str, new_role: str) -> bool:
     except Exception as e:
         logging.error(f"Ошибка смены роли в Firestore: {e}")
         return False
+    
+# ==================== ФУНКЦИИ REALTIME LISTENER ====================
+
+def start_structure_listener(firebase_signals: FirebaseSignals):
+    """
+    Устанавливает Realtime Listener на коллекцию 'structure'. 
+    Использует PyQt signal для уведомления главного потока Qt о изменениях.
+    """
+    if not db: 
+        logging.error("Firestore не инициализирован для запуска слушателя.")
+        return None
+    
+    def on_snapshot(col_snapshot, changes, read_time):
+        """
+        Callback, вызываемый при изменении структуры. 
+        Работает в фоновом потоке Firebase SDK.
+        """
+        # Проверяем, что есть реальные изменения (не только первичный снимок)
+        if changes:
+            logging.info(f"Обнаружено изменение в структуре гайдов. Количество изменений: {len(changes)}. Инициирую обновление через сигнал.")
+            # Испускаем сигнал, который будет безопасно обработан в главном потоке Qt
+            firebase_signals.guides_structure_changed.emit()
+
+    try:
+        col_ref = db.collection('structure')
+        # Запуск слушателя. col_watch - это функция отписки.
+        col_watch = col_ref.on_snapshot(on_snapshot)
+        
+        return col_watch
+        
+    except Exception as e:
+        logging.error(f"Ошибка установки слушателя структуры: {e}")
+        return None
