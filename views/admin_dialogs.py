@@ -189,8 +189,6 @@ class UserManagementDialog(QDialog):
             
             self.table.setCellWidget(row, 2, role_combo)
 
-        logging.info(f"Загружено {len(self.users_data)} пользователей для управления.")
-
     def save_changes(self):
         """Сохраняет измененные роли пользователей."""
         changes_made = False
@@ -315,8 +313,6 @@ class GuideManagementDialog(QDialog):
             self.table.setCellWidget(row, 3, action_widget)
             # Устанавливаем высоту строки, чтобы кнопки выглядели лучше
             self.table.setRowHeight(row, 35) 
-
-        logging.info(f"Загружено {len(nodes)} узлов структуры гайдов.")
 
     def rename_node_dialog(self, doc_id: str, old_title: str):
         """Диалог переименования узла."""

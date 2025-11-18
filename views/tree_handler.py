@@ -2,7 +2,7 @@
 import logging
 from typing import TYPE_CHECKING
 from PyQt6.QtWidgets import QMenu, QInputDialog, QMessageBox, QTreeWidgetItem
-from PyQt6.QtCore import Qt, QPoint
+from PyQt6.QtCore import Qt, QPoint, QTimer # QTimer импортирован, но не используется в оптимизированном D&D
 from PyQt6.QtGui import QIcon, QAction
 import qtawesome as qta
 
@@ -10,9 +10,10 @@ from config import DEFAULT_GUIDE_CONTENT
 from core.firebase_service import (
     get_structure_metadata, get_all_guides_for_search_new,
     create_new_node, rename_node, delete_node_recursively,
-    start_structure_listener
+    start_structure_listener, listener_running, update_node_metadata, update_node_order
 )
 from core.signals import FirebaseSignals
+from views.custom_widgets import CustomTreeWidget
 
 if TYPE_CHECKING:
     from views.main_window import MainWindow
@@ -22,21 +23,37 @@ class TreeHandlerMixin:
 
     def init_tree(self):
         """Инициализация компонентов, связанных с деревом."""
-        self.tree = None  # Будет инициализировано в _create_sidebar
+        self.tree = CustomTreeWidget(handler=self)
+        # self.is_handling_local_dnd = False <-- УДАЛЕНО: Больше не нужен
         self.guide_map = {}
         self.search_cache = {}
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDragDropMode(self.tree.DragDropMode.InternalMove)
+        self.tree.setSelectionMode(self.tree.SelectionMode.SingleSelection)
         """Инициализация сигнального объекта"""
         self.firebase_signals = FirebaseSignals()
         """Переменная для хранения функции отписки"""
         self.unsubscribe_structure_listener = None
+        """ПРЕДОТВРАЩЕНИЕ ПОВТОРНОГО ЗАПУСКА"""
+        self._listener_started = False
         """Подключение сигнала Realtime Listener к слоту обновления"""
         self.firebase_signals.guides_structure_changed.connect(self._handle_structure_update)
+        # --- ОПТИМИЗАЦИЯ: Таймер для Debouncing ---
+        self.repopulate_timer = QTimer(self.tree)
+        self.repopulate_timer.setSingleShot(True)
+        # Устанавливаем задержку, например, 200 мс. Это время "тишины" между обновлениями.
+        self.repopulate_timer.setInterval(200) 
+        self.repopulate_timer.timeout.connect(lambda: self.repopulate_tree("DEBOUNCED_UPDATE"))
+        # --- КОНЕЦ: Таймер для Debouncing ---
 
     """Новый слот для обработки сигнала"""
     def _handle_structure_update(self):
         """Слот для обработки сигнала об изменении структуры гайдов из Firestore."""
-        logging.info("Realtime-сигнал об изменении структуры получен. Запуск обновления дерева.")
+        # Listener всегда вызывает repopulate_tree, даже после D&D
         self.repopulate_tree("REALTIME_UPDATE")
+        self.repopulate_timer.start()
 
     """Новый метод для запуска слушателя"""
     def start_realtime_listeners(self):
@@ -44,51 +61,109 @@ class TreeHandlerMixin:
         if not self.unsubscribe_structure_listener:
             # Вызываем функцию из firebase_service для запуска слушателя
             self.unsubscribe_structure_listener = start_structure_listener(self.firebase_signals)
-            if self.unsubscribe_structure_listener:
-                logging.info("Слушатель структуры Firebase успешно запущен.")
-            else:
-                logging.error("Не удалось запустить слушатель структуры Firebase.")
 
+    """Остановка слушателя Firebase при закрытии приложения."""
+    def stop_realtime_listeners(self):
+        global listener_running
+        if self.unsubscribe_structure_listener:
+            self.unsubscribe_structure_listener()
+            self.unsubscribe_structure_listener = None
+            logging.info("Слушатель структуры Firebase остановлен.")
+            listener_running = False
+            
+    """Заполняет дерево гайдов на основе метаданных структуры из Firestore."""
     def populate_tree(self, reason: str = "ЗАПУCК ПРИЛОЖЕНИЯ У ПОЛЬЗОВАТЕЛЯ."):
-        """Заполняет дерево гайдов на основе метаданных структуры из Firestore."""
-        self.tree.clear()
-        self.guide_map.clear()
+            """
+            Заполняет дерево гайдов, используя рекурсивный подход, 
+            сохраняя и восстанавливая состояние развертывания и выбора.
+            """
+            
+            # --- ОПТИМИЗАЦИЯ: Сохранение состояния ---
+            expanded_ids = {item.data(0, Qt.ItemDataRole.UserRole) 
+                            for item in self.tree.findItems("", Qt.MatchFlag.MatchRecursive) 
+                            if item.isExpanded() and item.data(0, Qt.ItemDataRole.UserRole)}
+            selected_id = self.tree.currentItem().data(0, Qt.ItemDataRole.UserRole) if self.tree.currentItem() else None
+            # --- КОНЕЦ: Сохранение состояния ---
+            
+            self.tree.clear()
+            self.guide_map.clear()
 
-        nodes = get_structure_metadata()
-        if not nodes:
-            logging.warning("Не удалось загрузить структуру гайдов.")
-            return
+            nodes = get_structure_metadata()
+            if not nodes:
+                logging.warning("Не удалось загрузить структуру гайдов.")
+                return
 
-        root_items = {}
-        for node in sorted(nodes, key=lambda x: x.get('order', 0)):
-            item = QTreeWidgetItem([node['name']])
-            item.setData(0, Qt.ItemDataRole.UserRole, node['id'])
-            item.setData(0, Qt.ItemDataRole.UserRole + 1, node['type'])
+            # 1. Создаем список всех действительных ID узлов для проверки
+            valid_node_ids = {node['id'] for node in nodes}
+            
+            # 2. Сгруппировать узлы по parent_id, отфильтровывая циклические/несуществующие ссылки
+            nodes_by_parent = {}
+            
+            for node in nodes:
+                node_id = node['id']
+                parent_id = node.get('parent_id')
+                
+                # Проверка 1: Циклическая зависимость (узел родитель самому себе)
+                if parent_id == node_id:
+                    logging.error(f"Обнаружен циклический узел (родитель = сам себе): {node_id}. Добавляется как корневой.")
+                    parent_id = None
+                
+                # Проверка 2: Родитель не существует в текущем наборе узлов
+                elif parent_id is not None and parent_id not in valid_node_ids:
+                    logging.warning(f"Родитель {parent_id} не найден для узла {node_id}. Добавляется как корневой.")
+                    parent_id = None
 
-            icon = qta.icon("fa5s.file-alt", color="#e0e0e0") if node['type'] == 'guide' else qta.icon("fa5s.folder", color="#ffd700")
-            item.setIcon(0, icon)
+                if parent_id not in nodes_by_parent:
+                    nodes_by_parent[parent_id] = []
+                nodes_by_parent[parent_id].append(node)
+                
+            # 3. Рекурсивная функция для построения элементов
+            def build_tree_items(parent_id: str | None, parent_widget=None):
+                children = nodes_by_parent.get(parent_id) or []
+                
+                # ИЗМЕНЕНИЕ: Сортировка только по полю 'order'
+                sorted_children = sorted(children, key=lambda node: node.get('order', 0))
 
-            if self.is_editable:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                for node in sorted_children:
+                    item = QTreeWidgetItem([node['name']])
+                    item.setData(0, Qt.ItemDataRole.UserRole, node['id'])
+                    item.setData(0, Qt.ItemDataRole.UserRole + 1, node['type'])
+                    
+                    self.guide_map[node['id']] = node['name']
+                    
+                    icon = qta.icon("fa5s.file-alt", color="#e0e0e0") if node['type'] == 'guide' else qta.icon("fa5s.folder", color="#ffd700")
+                    item.setIcon(0, icon)
+                    
+                    if self.is_editable:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
 
-            parent_id = node.get('parent_id')
-            if not parent_id:
-                self.tree.addTopLevelItem(item)
-                root_items[node['id']] = item
-            else:
-                parent_item = root_items.get(parent_id)
-                if parent_item:
-                    parent_item.addChild(item)
-                    root_items[node['id']] = item
-                else:
-                    logging.warning(f"Родитель {parent_id} не найден для узла {node['id']}.")
+                    if parent_widget is None:
+                        self.tree.addTopLevelItem(item)
+                    else:
+                        parent_widget.addChild(item)
+                    
+                    # --- ОПТИМИЗАЦИЯ: Восстановление состояния (Expand) ---
+                    if node['id'] in expanded_ids:
+                        item.setExpanded(True)
+                    # --- КОНЕЦ: Восстановление состояния ---
+                    
+                    build_tree_items(node['id'], item)
 
-            self.guide_map[node['id']] = node['name']
+            # 4. Запуск построения дерева с корневого уровня (None)
+            build_tree_items(None)
 
-        self.tree.expandAll()
-        self.search_cache = get_all_guides_for_search_new()
-        logging.info(f"Дерево гайдов обновлено: {len(nodes)} узлов.")
+            # self.tree.expandAll() <-- УДАЛЕНО: Расширяем только сохраненные узлы
+            
+            # --- ОПТИМИЗАЦИЯ: Восстановление выбора ---
+            if selected_id:
+                # Ищем элемент по ID
+                items = self.tree.findItems(selected_id, Qt.MatchFlag.MatchRecursive, column=0)
+                if items:
+                    self.tree.setCurrentItem(items[0])
+            # --- КОНЕЦ: Восстановление выбора ---
 
+            self.search_cache = get_all_guides_for_search_new()
+            
     def repopulate_tree(self,reason: str = "ОБЩЕЕ ОБНОВЛЕНИЕ У ПОЛЬЗОВАТЕЛЕЙ."):
         """Перезагружает дерево и обновляет текущий гайд."""
         self.populate_tree(reason )
@@ -204,8 +279,8 @@ class TreeHandlerMixin:
         if ok and name.strip():
             new_id = create_new_node(name.strip(), parent_id, 'guide', DEFAULT_GUIDE_CONTENT(name.strip()))
             if new_id:
-                reason = f"Добавление нового гайда: '{name.strip()}' (ID: {new_id})"
-                self.repopulate_tree(reason) # Передаем причину
+                # Теперь полагаемся на Listener, который вызовет repopulate_tree
+                logging.info(f"Запрос на добавление гайда '{name.strip()}' отправлен в Firestore.")
             else:
                 QMessageBox.critical(self, "Ошибка", "Не удалось создать гайд.")
 
@@ -215,8 +290,8 @@ class TreeHandlerMixin:
         if ok and name.strip():
             new_id = create_new_node(name.strip(), parent_id, 'folder')
             if new_id:
-                reason = f"Добавление новой папки: '{name.strip()}' (ID: {new_id})"
-                self.repopulate_tree(reason) # Передаем причину
+                # Теперь полагаемся на Listener, который вызовет repopulate_tree
+                logging.info(f"Запрос на добавление папки '{name.strip()}' отправлен в Firestore.")
             else:
                 QMessageBox.critical(self, "Ошибка", "Не удалось создать папку.")
 
@@ -230,8 +305,7 @@ class TreeHandlerMixin:
         if ok and new_name.strip() and new_name != old_name:
             if rename_node(node_id, new_name.strip()):
                 QMessageBox.information(self, "Успех", f"Узел '{old_name}' переименован в '{new_name.strip()}'")
-                reason = f"Переименование узла: {new_name.strip()} | ID: {node_id})"
-                self.repopulate_tree(reason) # Передаем причину
+                # Теперь полагаемся на Listener, который вызовет repopulate_tree
             else:
                 QMessageBox.critical(self, "Ошибка", "Не удалось переименовать узел.")
 
@@ -246,11 +320,71 @@ class TreeHandlerMixin:
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             if delete_node_recursively(node_id):
-                reason = f"Удаление узла: {name.strip()} | ID: {node_id})"
-                self.repopulate_tree(reason) # Передаем причину
+                # Теперь полагаемся на Listener, который вызовет repopulate_tree
                 QMessageBox.information(self, "Успех", f"Узел '{name}' и содержимое удалены.")
-                self.repopulate_tree()
                 return True
             else:
                 QMessageBox.critical(self, "Ошибка", "Не удалось удалить узел.")
         return False
+        
+    def handle_tree_structure_change(self, moved_item: QTreeWidgetItem):
+        """
+        Обновляет метаданные Firestore после успешной операции Drag and Drop.
+        
+        Эта функция отправляет два обновления: 
+        1. Изменение родителя (parent_id) для перемещенного узла.
+        2. Изменение порядка (order) для всех братьев и сестер.
+        
+        Оба обновления вызовут Realtime Listener, который автоматически
+        перезагрузит дерево у всех пользователей (включая инициатора D&D).
+        """
+        # Флаг self.is_handling_local_dnd и сброс флага удалены.
+        moved_id = moved_item.data(0, Qt.ItemDataRole.UserRole)
+
+        # 1. Определение нового родителя (new_parent_id)
+        new_parent_widget = moved_item.parent()
+        new_parent_id = None
+        
+        if new_parent_widget:
+            # Получаем ID родителя, если он есть
+            new_parent_id = new_parent_widget.data(0, Qt.ItemDataRole.UserRole)
+            
+        # 2. Обновление родителя в базе данных
+        if update_node_metadata(moved_id, {'parent_id': new_parent_id}):
+            logging.info(f"Перемещен узел {moved_id}. Новый родитель: {new_parent_id}")
+        else:
+            logging.error(f"Не удалось обновить parent_id для узла {moved_id}.")
+
+        # 3. Обновление порядка (order) для всех братьев и сестер (по индексу)
+        
+        # Получаем виджет, содержащий перемещенные элементы
+        parent_widget_for_order = moved_item.parent() if moved_item.parent() else self.tree
+        siblings_data = []
+
+        is_root = parent_widget_for_order == self.tree
+        
+        # Определяем функции для подсчета и получения дочерних элементов
+        count_func = self.tree.topLevelItemCount if is_root else parent_widget_for_order.childCount
+        item_func = self.tree.topLevelItem if is_root else parent_widget_for_order.child
+
+        # Итерируем по всем детям в их текущем ВИЗУАЛЬНОМ порядке
+        for i in range(count_func()):
+            child_item = item_func(i)
+            
+            if not child_item: continue
+
+            node_id = child_item.data(0, Qt.ItemDataRole.UserRole)
+            # Шаг 10 обеспечивает возможность добавления промежуточных элементов.
+            new_order_value = i * 10 
+            
+            siblings_data.append({
+                'id': node_id,
+                'order': new_order_value, 
+            })
+            
+        # 4. Сохраняем новый порядок в базу данных
+        if update_node_order(siblings_data):
+            logging.info(f"Обновлен порядок для {len(siblings_data)} узлов (братьев/сестер {new_parent_id}).")
+        else:
+            logging.error("Не удалось обновить порядок узлов в Firebase.")
+            

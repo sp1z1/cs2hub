@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import random
+from typing import List, Dict
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
@@ -13,9 +14,12 @@ from PyQt6.QtWidgets import QMessageBox
 from google.cloud.firestore import FieldFilter 
 
 from config import CRED_PATH, FIREBASE_STORAGE_BUCKET, DEFAULT_GUIDE_CONTENT
+from core.signals import FirebaseSignals
 from utils.helpers import hash_password
 
-db = None 
+db = None
+
+listener_running = False
 
 def init_firebase():
     """Инициализирует клиент Firebase/Firestore и Storage."""
@@ -32,7 +36,6 @@ def init_firebase():
                 'storageBucket': FIREBASE_STORAGE_BUCKET.replace("gs://", "")
             })
             db = firestore.client()
-            logging.info("Firebase успешно инициализирован.")
             return db
         except Exception as e:
             logging.error(f"Ошибка инициализации Firebase: {e}")
@@ -79,7 +82,6 @@ def ensure_initial_guides():
             'password_hash': admin_password_hash,
             'role': 'admin'
         })
-        logging.info("Создан админ по умолчанию.")
 
     # 2. Начальная структура и контент
     structure_ref = db.collection('structure')
@@ -134,7 +136,7 @@ def ensure_initial_guides():
 
 def get_structure_metadata():
     """Возвращает все узлы структуры (папки и гайды) для построения дерева."""
-    if not db: return []
+    global db
     try:
         # Загружаем узлы, отсортированные для удобства построения дерева
         nodes = db.collection('structure').order_by('parent_id').order_by('order').stream()
@@ -145,7 +147,7 @@ def get_structure_metadata():
 
 def create_new_node(name: str, parent_id: str | None, node_type: str, guide_content: str | None = None) -> str | None:
     """Создает новый узел структуры (папку или гайд) и контент для гайда."""
-    if not db: return None
+    global db
     try:
         # 1. Определяем следующий номер порядка
         # 🚀 ИСПРАВЛЕНО: Заменили позиционные аргументы в .where() на filter=FieldFilter
@@ -372,36 +374,93 @@ def set_user_role_firestore(login: str, new_role: str) -> bool:
     except Exception as e:
         logging.error(f"Ошибка смены роли в Firestore: {e}")
         return False
-    
-# ==================== ФУНКЦИИ REALTIME LISTENER ====================
+#=====================
+def update_node_metadata(node_id: str, data: dict) -> bool:
+    global db
+    """
+    Обновляет метаданные конкретного узла по его ID.
+    Используется для изменения parent_id.
+    """
+    try:
+        # ИСПРАВЛЕНО: Замена 'nodes' на 'structure'
+        db.collection('structure').document(node_id).update(data)
+        
+        logging.info(f"Метаданные узла {node_id} обновлены: {data}")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при обновлении метаданных узла {node_id}: {e}")
+        return False
+        
+def update_node_order(siblings_data: List[Dict]):
+    """Обновляет поле 'order' для списка узлов в одной пакетной операции."""
+    global db
+    if not db:
+        return False
 
+    batch = db.batch()
+    try:
+        for data in siblings_data:
+            node_id = data.get('id')
+            new_order = data.get('order')
+
+            if node_id is not None and new_order is not None:
+                doc_ref = db.collection('structure').document(node_id)
+                # Убеждаемся, что `order` сохраняется как целое число
+                batch.update(doc_ref, {'order': int(new_order)}) 
+
+        batch.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при массовом обновлении порядка узлов: {e}")
+        return False
+# ==================== ФУНКЦИИ REALTIME LISTENER ====================
 def start_structure_listener(firebase_signals: FirebaseSignals):
     """
     Устанавливает Realtime Listener на коллекцию 'structure'. 
-    Использует PyQt signal для уведомления главного потока Qt о изменениях.
+    Использует замыкание для доступа к firebase_signals и call_count.
     """
+    global db, listener_running
+
     if not db: 
         logging.error("Firestore не инициализирован для запуска слушателя.")
         return None
     
-    def on_snapshot(col_snapshot, changes, read_time):
-        """
-        Callback, вызываемый при изменении структуры. 
-        Работает в фоновом потоке Firebase SDK.
-        """
-        # Проверяем, что есть реальные изменения (не только первичный снимок)
-        if changes:
-            logging.info(f"Обнаружено изменение в структуре гайдов. Количество изменений: {len(changes)}. Инициирую обновление через сигнал.")
-            # Испускаем сигнал, который будет безопасно обработан в главном потоке Qt
+    # Переменная для подсчета вызовов, будет доступна через замыкание (nonlocal)
+    call_count = 0 
+    
+    def on_snapshot(query_snapshot, changes, read_time):
+        nonlocal call_count
+        call_count += 1
+            
+        if not changes:
+            return
+
+        # 1. ПЕРВЫЙ ВЫЗОВ (Initial Load). Принимаем его для заполнения дерева.
+        if call_count == 1:
+            reason = "ПЕРВОНАЧАЛЬНАЯ ЗАГРУЗКА"
+            logging.info(f"Realtime-слушатель: {reason} структуры.")
+            firebase_signals.guides_structure_changed.emit()
+                
+        # 2. ВТОРОЙ ВЫЗОВ (Дубликат Initial Snapshot). Игнорируем.
+        elif call_count == 2:
+            logging.debug("Realtime-слушатель: Пропуск второго (дублирующего) 'Initial Snapshot'.")
+            return
+
+        # 3. ВСЕ ПОСЛЕДУЮЩИЕ ВЫЗОВЫ (Realtime Changes) - принимаем.
+        else:
+            reason = "ФАКТИЧЕСКОЕ ИЗМЕНЕНИЕ"
+            logging.info(f"Обнаружено изменение в структуре гайдов ({reason}). Количество изменений: {len(changes)}. Инициирую обновление через сигнал.")
             firebase_signals.guides_structure_changed.emit()
 
     try:
         col_ref = db.collection('structure')
         # Запуск слушателя. col_watch - это функция отписки.
         col_watch = col_ref.on_snapshot(on_snapshot)
-        
+        listener_running = True
+        logging.info("Слушатель структуры Firebase успешно запущен.")
         return col_watch
         
     except Exception as e:
         logging.error(f"Ошибка установки слушателя структуры: {e}")
+        listener_running = False
         return None

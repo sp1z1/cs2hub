@@ -49,8 +49,6 @@ class MainWindow(TreeHandlerMixin, ContentHandlerMixin, AdminMixin, StatusMixin,
         self.setup_ui()
         self.setup_toolbar()
         self.apply_style()
-
-        self.populate_tree() # Вызов метода из TreeHandlerMixin
         
         # 1. Сначала открывается блок просмотра
         self.load_guide_by_node_id("root_info") 
@@ -87,7 +85,6 @@ class MainWindow(TreeHandlerMixin, ContentHandlerMixin, AdminMixin, StatusMixin,
         self.search_input.textChanged.connect(lambda: self.search_timer.start(300)) 
         sidebar_layout.addWidget(self.search_input)
 
-        self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)

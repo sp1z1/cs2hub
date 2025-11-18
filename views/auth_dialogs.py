@@ -1,5 +1,5 @@
 # views/auth_dialogs.py
-import re
+import re, logging
 import qtawesome as qta
 from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QLabel, 

@@ -8,6 +8,9 @@ import config
 from core.firebase_service import init_firebase, ensure_initial_guides
 from views.auth_dialogs import LoginDialog
 from views.main_window import MainWindow
+from utils.helpers import resource_path
+
+creds_file_path = resource_path("firebase_creds.json")
 
 # --- Новая функция для создания и запуска главного окна ---
 def launch_main_window(login_dialog: LoginDialog):
@@ -61,8 +64,7 @@ def main():
             
         else:
             # Отмена входа или закрытие окна логина: выходим из приложения
-            sys.exit(0)
-            
+            sys.exit(0)      
 if __name__ == '__main__':
     config.setup_logging()
     main()

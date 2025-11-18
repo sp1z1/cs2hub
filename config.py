@@ -39,7 +39,7 @@ def setup_logging():
     console_handler.setLevel(logging.WARNING) 
     logger.addHandler(console_handler)
     
-    logging.info("=============CS2 Guide Hub v1.01=============")
+
 
 
 setup_logging() 
