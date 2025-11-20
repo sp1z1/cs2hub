@@ -1,4 +1,5 @@
-# views/content_handler.py
+# views/content_handler.py (Полностью обновленный код)
+
 import logging
 import markdown
 from PyQt6.QtCore import QTimer
@@ -6,7 +7,7 @@ from PyQt6.QtWidgets import QMessageBox
 
 from core.firebase_service import (
     get_guide_content_firestore_by_structure_id as get_guide_content,
-    save_guide_content_by_structure_id as save_guide_firestore,
+    save_guide_content_firestore_by_structure_id as save_guide_firestore,
 )
 
 
@@ -17,10 +18,7 @@ class ContentHandlerMixin:
         self.content_changed = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_webview)
-        self.action_save = None
-        self.btn_cancel = None
-        # self.is_editable, self.editor, self.webview должны быть инициализированы в MainWindow
-
+    
     def load_guide_by_node_id(self, node_id: str):
         if self.content_changed and self.is_editable:
             reply = QMessageBox.question(self, "Несохранённые изменения",
@@ -29,33 +27,46 @@ class ContentHandlerMixin:
             if reply == QMessageBox.StandardButton.Cancel:
                 return
             if reply == QMessageBox.StandardButton.Yes:
-                # save_current_guide теперь должен возвращать True/False
                 if not self.save_current_guide(): 
-                    # Если сохранение не удалось, остаемся на текущем гайде
                     return
 
         data = get_guide_content(node_id)
         if data:
             self.current_guide_fn = node_id
             self.original_content = data.get("content", "")
-            self.editor.setPlainText(self.original_content)
+            self.current_last_modified = data.get("last_modified") 
+            
+            # Загружаем контент в редактор ТОЛЬКО если мы уже в режиме редактирования
+            if hasattr(self, 'is_editing_mode') and self.is_editing_mode:
+                self.editor.setPlainText(self.original_content)
+                
             self.update_webview()
             self.content_changed = False
             
-            if self.action_save:
-                self.action_save.setEnabled(False)
-            
-            # Внимание: Вызов self.toggle_edit_mode(False) происходит в MainWindow.load_guide_by_node_id, 
-            # обеспечивая переключение в режим просмотра
+            # Обновление иконок и кнопок
+            if hasattr(self, 'update_save_status_icons'):
+                self.update_save_status_icons()
+
+            # Скрытие кнопки Перезагрузить после успешной загрузки
+            if hasattr(self, 'btn_reload'):
+                 self.btn_reload.setVisible(False)
             
             self.set_status_ok(f"Гайд загружен", 2000)
         else:
             self.editor.clear()
             self.webview.setHtml("")
             self.current_guide_fn = None
+            self.current_last_modified = None 
 
     def update_webview(self):
-        md = self.editor.toPlainText()
+        # Показываем контент из редактора, если мы в режиме редактирования, иначе - оригинальный контент
+        md = self.editor.toPlainText() if self.is_editing_mode else self.original_content
+        
+        # Если контент пуст, ничего не показываем
+        if not md:
+            self.webview.setHtml("")
+            return
+            
         html = markdown.markdown(md, extensions=["fenced_code", "tables", "toc", "nl2br"])
         styled = f"""
         <html><head><style>
@@ -73,40 +84,74 @@ class ContentHandlerMixin:
             return
         changed = self.editor.toPlainText() != self.original_content
         self.content_changed = changed
-        if self.action_save:
-            self.action_save.setEnabled(changed)
-        # Видимость кнопки Отмена должна быть False при отсутствии изменений 
-        # (но она также контролируется toggle_edit_mode)
-        if self.btn_cancel:
-            self.btn_cancel.setVisible(changed)
+        
+        # Обновление иконок и кнопок
+        if hasattr(self, 'update_save_status_icons'):
+            self.update_save_status_icons()
+        if self.is_editing_mode: 
+            self.update_webview() # <-- ЭТО ОБЕСПЕЧИТ ПОКАЗ ТЕКСТА НА ПРЕВЬЮ
 
     def cancel_edit(self):
-        """Отменяет изменения контента. Переключение режима делегируется MainWindow."""
+        """Отменяет изменения контента."""
         if self.current_guide_fn and self.is_editable:
+            # Загружаем оригинальный контент в редактор
             self.editor.setPlainText(self.original_content)
             self.content_changed = False
-            if self.action_save:
-                self.action_save.setEnabled(False)
             
-            # Удалено: self.btn_cancel.hide()
+            # Обновление иконок и кнопок
+            if hasattr(self, 'update_save_status_icons'):
+                self.update_save_status_icons()
+
+            # Скрытие кнопки Перезагрузить
+            if hasattr(self, 'btn_reload'):
+                 self.btn_reload.setVisible(False)
             
             self.update_webview()
             self.set_status_ok("Изменения отменены", 2000)
 
     def save_current_guide(self):
-        """Сохраняет контент. Переключение режима делегируется MainWindow."""
+        """Сохраняет контент с проверкой конфликта."""
         if not self.current_guide_fn or not self.is_editable:
             return False
         
-        if save_guide_firestore(self.current_guide_fn, self.editor.toPlainText()):
-            self.original_content = self.editor.toPlainText()
+        new_content = self.editor.toPlainText()
+        
+        # Передаем старую метку времени для проверки конфликта в Firestore
+        result = save_guide_firestore(
+            self.current_guide_fn, 
+            new_content, 
+            self.current_last_modified
+        )
+
+        if result is True:
+            # УСПЕХ: Обновляем локальное состояние
+            self.original_content = new_content
             self.content_changed = False
-            if self.action_save:
-                self.action_save.setEnabled(False)
-            
-            # Удалено: self.btn_cancel.hide()
             
             self.set_status_ok("Сохранено", 3000)
             self.update_webview()
+            
+            # Перезагружаем гайд, чтобы получить новую метку SERVER_TIMESTAMP
+            self.load_guide_by_node_id(self.current_guide_fn)
             return True
-        return False
+            
+        elif result == "conflict":
+            # КОНФЛИКТ: Сообщаем пользователю и предлагаем перезагрузить
+            QMessageBox.warning(
+                self, 
+                "Конфликт сохранения", 
+                "Этот гайд был изменен другим пользователем. Ваши изменения не сохранены. "
+                "Ваш черновик остается в редакторе. Нажмите 'Перезагрузить' для загрузки последней версии с сервера (ваши изменения будут потеряны)."
+            )
+            self.set_status_error("Конфликт! Не сохранено.", 5000)
+            
+            # Показываем кнопку "Перезагрузить"
+            if hasattr(self, 'btn_reload'):
+                 self.btn_reload.setVisible(True)
+                 
+            return False 
+            
+        else: # Общая ошибка (False)
+            QMessageBox.critical(self, "Ошибка сохранения", "Произошла ошибка при сохранении контента.")
+            self.set_status_error("Ошибка сохранения.", 5000)
+            return False

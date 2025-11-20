@@ -10,8 +10,6 @@ from views.auth_dialogs import LoginDialog
 from views.main_window import MainWindow
 from utils.helpers import resource_path
 
-creds_file_path = resource_path("firebase_creds.json")
-
 # --- Новая функция для создания и запуска главного окна ---
 def launch_main_window(login_dialog: LoginDialog):
     """Создает и показывает MainWindow после успешного входа."""

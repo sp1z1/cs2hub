@@ -152,21 +152,21 @@ class RegisterDialog(QDialog):
     def register(self):
         login_text = self.login.text().strip()
         pwd1_text = self.pwd1.text()
-        pwd2_text = self.pwd2.text()
+        # pwd2_text проверка уже есть в валидаторе
         
         login_ok = self.validate_login_live()
         pwd_ok = self.validate_password_live()
 
-        if not login_text or not pwd1_text or not pwd2_text:
+        if not login_text or not pwd1_text:
             QMessageBox.warning(self, "Ошибка", "Все поля должны быть заполнены.")
             return
             
         if not login_ok or not pwd_ok:
             return 
 
-        password_hash = hash_password(pwd1_text) 
-
-        if register_user_firestore(login_text, password_hash):
+        # ИЗМЕНЕНО: Передаем pwd1_text (чистый пароль)
+        # Сервис сам его захеширует.
+        if register_user_firestore(login_text, pwd1_text):
             QMessageBox.information(self, "Готово", "Аккаунт создан! Теперь войдите.")
             self.accept()
         else:
@@ -354,9 +354,9 @@ class LoginDialog(QDialog):
         if not self.validate_login_live():
             return
 
-        password_hash = hash_password(password_text)
-
-        result = get_user_role_firestore(login_text, password_hash)
+        # ИЗМЕНЕНО: Передаем password_text (чистый пароль)
+        # Сервис внутри использует check_password
+        result = get_user_role_firestore(login_text, password_text)
         
         if isinstance(result, str) and result not in ('Неверный_пароль', 'Пользователя_не_существует'):
             self.role = result
@@ -369,6 +369,5 @@ class LoginDialog(QDialog):
             self.login_edit.setFocus()
         else:
             QMessageBox.critical(self, "Ошибка", "Не удалось подключиться к базе данных.")
-
     def get_role(self):
         return self.role

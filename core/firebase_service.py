@@ -3,11 +3,12 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import random
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from PyQt6.QtWidgets import QMessageBox
+from core.signals import FirebaseSignals
 
 # !!! НОВЫЙ ИМПОРТ ДЛЯ ИСПРАВЛЕНИЯ ПРЕДУПРЕЖДЕНИЯ !!!
 # Требуется FieldFilter для использования современного синтаксиса фильтрации.
@@ -15,11 +16,16 @@ from google.cloud.firestore import FieldFilter
 
 from config import CRED_PATH, FIREBASE_STORAGE_BUCKET, DEFAULT_GUIDE_CONTENT
 from core.signals import FirebaseSignals
-from utils.helpers import hash_password
+from utils.helpers import hash_password, check_password
 
 db = None
-
 listener_running = False
+_structure_watch = None
+firebase_signals = FirebaseSignals()
+
+class ConflictError(Exception):
+    """Исключение для обозначения конфликта при сохранении (оптимистическая блокировка)"""
+    pass
 
 def init_firebase():
     """Инициализирует клиент Firebase/Firestore и Storage."""
@@ -90,7 +96,6 @@ def ensure_initial_guides():
     # Идентификаторы для базового контента
     content_ids = {
         'root_info': 'info_content_id',
-        'root_settings': 'settings_content_id',
     }
 
     initial_content = {
@@ -98,23 +103,21 @@ def ensure_initial_guides():
             "title": "Добро пожаловать!", 
             "content": "# Добро пожаловать...\n\nТекст приветствия."
         },
-        content_ids['root_settings']: {
-            "title": "Настройка CS2", 
-            "content": "# Настройка CS2\n\nОсновные настройки и конфиги."
-        },
     }
     
     # Создание контента
     for content_id, data in initial_content.items():
         content_doc = guides_ref.document(content_id)
         if not content_doc.get().exists:
-            batch.set(content_doc, data | {'last_modified': datetime.now().isoformat()})
+            # Использование SERVER_TIMESTAMP для атомарного времени
+            batch.set(content_doc, data | {'last_modified': firestore.SERVER_TIMESTAMP})
 
     # Создание узлов структуры
+    # 💡 НОВОЕ: Добавлены стандартные icon_name для системных узлов
     initial_structure = [
-        {'id': 'root_info', 'name': 'Добро пожаловать!', 'parent_id': None, 'type': 'guide', 'guide_doc_id': content_ids['root_info'], 'order': 10},
-        {'id': 'folder_maps', 'name': 'Гайды по картам', 'parent_id': None, 'type': 'folder', 'guide_doc_id': None, 'order': 20},
-        {'id': 'root_settings', 'name': 'Настройка CS2', 'parent_id': None, 'type': 'guide', 'guide_doc_id': content_ids['root_settings'], 'order': 30},
+        {'id': 'root_info', 'name': 'Добро пожаловать!', 'parent_id': None, 'type': 'guide', 'guide_doc_id': content_ids['root_info'], 'order': 10, 'icon_name': 'fa5s.info-circle'},
+        {'id': 'folder_maps', 'name': 'Гайды по картам', 'parent_id': None, 'type': 'folder', 'guide_doc_id': None, 'order': 20, 'icon_name': 'fa5s.map'},
+        {'id': 'folder_settings', 'name': 'Настройка CS2', 'parent_id': None, 'type': 'folder', 'guide_doc_id': None, 'order': 20, 'icon_name': 'fa5s.cog'}
     ]
 
     for node in initial_structure:
@@ -125,7 +128,8 @@ def ensure_initial_guides():
                 'parent_id': node['parent_id'], 
                 'type': node['type'], 
                 'guide_doc_id': node['guide_doc_id'],
-                'order': node['order']
+                'order': node['order'],
+                'icon_name': node['icon_name'] # 💡 НОВОЕ: Сохраняем иконку
             })
 
     if batch._write_pbs: 
@@ -145,7 +149,8 @@ def get_structure_metadata():
         logging.error(f"Ошибка получения структуры гайдов: {e}")
         return []
 
-def create_new_node(name: str, parent_id: str | None, node_type: str, guide_content: str | None = None) -> str | None:
+# 🚀 ИСПРАВЛЕНО: Добавлен аргумент icon_name
+def create_new_node(name: str, parent_id: str | None, node_type: str, guide_content: str | None = None, icon_name: str | None = None) -> str | None:
     """Создает новый узел структуры (папку или гайд) и контент для гайда."""
     global db
     try:
@@ -164,7 +169,8 @@ def create_new_node(name: str, parent_id: str | None, node_type: str, guide_cont
             guides_ref.set({
                 'title': name,
                 'content': guide_content or DEFAULT_GUIDE_CONTENT(name),
-                'last_modified': datetime.now().isoformat()
+                # Использование SERVER_TIMESTAMP
+                'last_modified': firestore.SERVER_TIMESTAMP
             })
             
         # 3. Создаем узел структуры
@@ -174,7 +180,8 @@ def create_new_node(name: str, parent_id: str | None, node_type: str, guide_cont
             'parent_id': parent_id,
             'type': node_type,
             'order': new_order,
-            'guide_doc_id': guide_doc_id
+            'guide_doc_id': guide_doc_id,
+            'icon_name': icon_name # 💡 НОВОЕ: Сохраняем имя иконки
         }
         
         node_ref.set(node_data)
@@ -183,20 +190,29 @@ def create_new_node(name: str, parent_id: str | None, node_type: str, guide_cont
         logging.error(f"Ошибка создания нового узла: {e}")
         return None
 
-def rename_node(node_id: str, new_name: str) -> bool:
-    """Переименовывает узел структуры и связанный с ним документ контента (если это гайд)."""
+# 🚀 ИСПРАВЛЕНО: Добавлен аргумент icon_name
+def rename_node(node_id: str, new_name: str, icon_name: str | None = None) -> bool:
+    """Переименовывает узел структуры и связанный с ним документ контента (если это гайд), а также меняет иконку."""
     if not db: return False
     try:
         node_ref = db.collection('structure').document(node_id)
         node_data = node_ref.get().to_dict()
         
-        node_ref.update({'name': new_name})
+        updates = {'name': new_name}
+        if icon_name:
+            updates['icon_name'] = icon_name # 💡 НОВОЕ: Обновляем иконку, если она передана
+            
+        node_ref.update(updates)
         
         if node_data and node_data.get('type') == 'guide':
-            guide_doc_id = node_data.get('guide_doc_id')
-            if guide_doc_id:
-                db.collection('guides').document(guide_doc_id).update({'title': new_name})
-        
+                guide_doc_id = node_data.get('guide_doc_id')
+                if guide_doc_id:
+                    db.collection('guides').document(guide_doc_id).update({
+                        'title': new_name,
+                        # Обновляем метку времени контента при переименовании
+                        'last_modified': firestore.SERVER_TIMESTAMP 
+                    })
+            
         return True
     except Exception as e:
         logging.error(f"Ошибка переименования узла {node_id}: {e}")
@@ -246,43 +262,86 @@ def delete_node_recursively(node_id: str) -> bool:
 
 # ==================== ФУНКЦИИ КОНТЕНТА ====================
 
-def get_guide_content_firestore_by_structure_id(structure_id: str) -> dict | None: 
-    """Получает контент гайда по ID узла структуры."""
+def get_guide_content_firestore_by_structure_id(structure_id: str) -> Dict[str, Any] | None:
+    """Извлекает контент гайда по ID узла структуры."""
+    global db
     if not db: return None
+
     try:
-        node = db.collection('structure').document(structure_id).get().to_dict()
-        if not node or node.get('type') != 'guide':
+        structure_doc = db.collection('structure').document(structure_id).get()
+        if not structure_doc.exists:
             return None
         
-        guide_doc_id = node.get('guide_doc_id')
-        if not guide_doc_id: return None
-            
-        doc = db.collection('guides').document(guide_doc_id).get()
-        return doc.to_dict() if doc.exists else None
-    except Exception as e:
-        logging.error(f"Ошибка получения контента для ID структуры {structure_id}: {e}")
-        return None
-        
-def save_guide_content_by_structure_id(structure_id: str, content: str) -> bool: 
-    """Сохраняет контент гайда по ID узла структуры."""
-    if not db: return False
-    try:
-        node = db.collection('structure').document(structure_id).get().to_dict()
-        if not node or node.get('type') != 'guide': return False
-            
-        guide_doc_id = node.get('guide_doc_id')
-        if not guide_doc_id: return False
+        guide_doc_id = structure_doc.to_dict().get('guide_doc_id')
+        if not guide_doc_id:
+            return None
 
-        now = datetime.now().isoformat()
-        guide_ref = db.collection('guides').document(guide_doc_id)
+        content_doc = db.collection('guides').document(guide_doc_id).get()
+        if content_doc.exists:
+            data = content_doc.to_dict()
+            # Преобразование timestamp в UNIX time (float) для сравнения в UI
+            last_modified_timestamp = data.get('last_modified')
+            if last_modified_timestamp and hasattr(last_modified_timestamp, 'timestamp'):
+                 data['last_modified'] = last_modified_timestamp.timestamp()
+            
+            return data
         
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка получения контента гайда {structure_id}: {e}")
+        return None
+
+
+def save_guide_content_firestore_by_structure_id(structure_id: str, new_content: str, last_modified_timestamp: float | None) -> bool | str:
+    """
+    Сохраняет контент гайда, используя оптимистическую блокировку.
+    
+    :param structure_id: ID узла структуры.
+    :param new_content: Новый контент для сохранения.
+    :param last_modified_timestamp: Последняя известная временная метка (UNIX time) извлеченная при загрузке.
+    :return: True при успешном сохранении, "conflict" при конфликте, False при общей ошибке.
+    """
+    global db
+    if not db: return False
+
+    try:
+        # 1. Получаем guide_doc_id
+        structure_doc = db.collection('structure').document(structure_id).get()
+        if not structure_doc.exists:
+            logging.warning(f"Структура для ID {structure_id} не найдена.")
+            return False
+        
+        guide_doc_id = structure_doc.to_dict().get('guide_doc_id')
+        if not guide_doc_id:
+            logging.warning(f"guide_doc_id для {structure_id} отсутствует.")
+            return False
+
+        guide_ref = db.collection('guides').document(guide_doc_id)
+
+        # 2. Оптимистическая блокировка (проверка конфликта)
+        if last_modified_timestamp is not None:
+            # Получаем текущий документ, чтобы проверить метку времени
+            current_guide_doc = guide_ref.get()
+            
+            if current_guide_doc.exists:
+                current_last_modified = current_guide_doc.to_dict().get('last_modified')
+                
+                # Сравниваем временные метки: если они разные, значит, кто-то изменил документ.
+                if current_last_modified and hasattr(current_last_modified, 'timestamp'):
+                    # Если версия на сервере новее, чем та, которую редактировал пользователь:
+                    if current_last_modified.timestamp() > last_modified_timestamp:
+                        logging.warning(f"Конфликт сохранения для гайда {structure_id}. Версия на сервере новее.")
+                        return "conflict"
+
+        # 3. Сохранение (обновление)
         guide_ref.update({
-            'content': content,
-            'last_modified': now
+            'content': new_content,
+            'last_modified': firestore.SERVER_TIMESTAMP # Устанавливаем новую метку времени
         })
         return True
+    
     except Exception as e:
-        logging.error(f"Ошибка сохранения контента для ID структуры {structure_id}: {e}")
+        logging.error(f"Ошибка сохранения контента гайда {structure_id}: {e}")
         return False
         
 def get_all_guides_for_search_new():
@@ -311,13 +370,17 @@ def get_all_guides_for_search_new():
         return {}
 
 # ==================== ФУНКЦИИ ПОЛЬЗОВАТЕЛЕЙ (CRUD) ====================
-def get_user_role_firestore(login: str, password_hash: str) -> str | None:
+def get_user_role_firestore(login: str, password: str) -> str | None:
+    """Проверяет пару логин/пароль и возвращает роль."""
     if not db: return None
     try:
         doc = db.collection('users').document(login).get()
         if doc.exists:
             data = doc.to_dict()
-            if data.get('password_hash') == password_hash:
+            stored_hash = data.get('password_hash')
+            
+            # !!! КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Использование check_password !!!
+            if stored_hash and check_password(password, stored_hash):
                 return data.get('role', 'user')
             else:
                 return 'Неверный_пароль'
@@ -326,15 +389,18 @@ def get_user_role_firestore(login: str, password_hash: str) -> str | None:
         logging.error(f"Ошибка аутентификации в Firestore: {e}")
         return None
 
-def register_user_firestore(login: str, password_hash: str) -> bool:
+def register_user_firestore(login: str, password: str) -> bool:
     if not db: return False
     try:
         user_ref = db.collection('users').document(login)
         if user_ref.get().exists:
             return False # Логин занят
+        
+        # !!! Хешируем пароль прямо перед сохранением !!!
+        final_hash = hash_password(password)
             
         user_ref.set({
-            'password_hash': password_hash,
+            'password_hash': final_hash,
             'role': 'user'
         })
         return True
@@ -344,14 +410,13 @@ def register_user_firestore(login: str, password_hash: str) -> bool:
 
 def get_all_users_firestore():
     """
-    [ИСПРАВЛЕНО] Получает всех пользователей из коллекции 'users'.
+    Получает всех пользователей из коллекции 'users'.
     Возвращает словарь: {login: user_data_dict}.
     """
     if not db: return {}
     try:
         users = db.collection('users').stream()
         
-        # 🚀 ИСПРАВЛЕНИЕ: Создаем словарь {login: user_data_dict}
         users_dict = {}
         for doc in users:
             login = doc.id
@@ -374,93 +439,80 @@ def set_user_role_firestore(login: str, new_role: str) -> bool:
     except Exception as e:
         logging.error(f"Ошибка смены роли в Firestore: {e}")
         return False
-#=====================
-def update_node_metadata(node_id: str, data: dict) -> bool:
-    global db
+
+def update_structure_after_drag_and_drop(updates: List[Dict[str, Any]]) -> bool:
     """
-    Обновляет метаданные конкретного узла по его ID.
-    Используется для изменения parent_id.
+    Сохраняет изменения parent_id и order после Drag-and-Drop,
+    используя пакетную запись (batch).
+    
+    updates - список словарей, каждый из которых имеет:
+    {'id': str, 'parent_id': str|None, 'order': int}
     """
-    try:
-        # ИСПРАВЛЕНО: Замена 'nodes' на 'structure'
-        db.collection('structure').document(node_id).update(data)
-        
-        logging.info(f"Метаданные узла {node_id} обновлены: {data}")
-        return True
-    except Exception as e:
-        logging.error(f"Ошибка при обновлении метаданных узла {node_id}: {e}")
+    global db # Здесь global db нужен, так как мы проверяем его статус в его родном модуле.
+    if not db: 
+        logging.error("Firestore не инициализирован для Drag-and-Drop.")
         return False
         
-def update_node_order(siblings_data: List[Dict]):
-    """Обновляет поле 'order' для списка узлов в одной пакетной операции."""
-    global db
-    if not db:
-        return False
-
-    batch = db.batch()
     try:
-        for data in siblings_data:
-            node_id = data.get('id')
-            new_order = data.get('order')
-
-            if node_id is not None and new_order is not None:
-                doc_ref = db.collection('structure').document(node_id)
-                # Убеждаемся, что `order` сохраняется как целое число
-                batch.update(doc_ref, {'order': int(new_order)}) 
-
+        batch = db.batch()
+        
+        for update in updates:
+            node_id = update['id']
+            
+            # Защита: Системные узлы всегда должны быть в корне (parent_id=None)
+            # (Здесь мы предполагаем, что вы знаете свои системные ID)
+            is_system_node = node_id in ['root_info', 'root_settings', 'folder_maps']
+            
+            effective_parent_id = update['parent_id']
+            if is_system_node and effective_parent_id is not None:
+                effective_parent_id = None
+                
+            ref = db.collection('structure').document(node_id)
+            
+            # Обновляем parent_id и order в пакете
+            batch.update(ref, {
+                'parent_id': effective_parent_id,
+                'order': update['order']
+            })
+            
         batch.commit()
+        logging.info(f"Пакетная запись {len(updates)} изменений структуры успешно выполнена.")
         return True
     except Exception as e:
-        logging.error(f"Ошибка при массовом обновлении порядка узлов: {e}")
+        logging.error(f"Ошибка сохранения структуры после D&D: {e}")
         return False
 # ==================== ФУНКЦИИ REALTIME LISTENER ====================
-def start_structure_listener(firebase_signals: FirebaseSignals):
-    """
-    Устанавливает Realtime Listener на коллекцию 'structure'. 
-    Использует замыкание для доступа к firebase_signals и call_count.
-    """
-    global db, listener_running
+def start_structure_listener():
+    global _structure_watch
 
-    if not db: 
-        logging.error("Firestore не инициализирован для запуска слушателя.")
+    if not db:
+        logging.error("Firestore не инициализирован.")
         return None
-    
-    # Переменная для подсчета вызовов, будет доступна через замыкание (nonlocal)
-    call_count = 0 
-    
+
+    if _structure_watch is not None:
+        logging.info("Слушатель уже запущен — используем существующий.")
+        return _structure_watch
+
     def on_snapshot(query_snapshot, changes, read_time):
-        nonlocal call_count
-        call_count += 1
-            
-        if not changes:
-            return
-
-        # 1. ПЕРВЫЙ ВЫЗОВ (Initial Load). Принимаем его для заполнения дерева.
-        if call_count == 1:
-            reason = "ПЕРВОНАЧАЛЬНАЯ ЗАГРУЗКА"
-            logging.info(f"Realtime-слушатель: {reason} структуры.")
-            firebase_signals.guides_structure_changed.emit()
-                
-        # 2. ВТОРОЙ ВЫЗОВ (Дубликат Initial Snapshot). Игнорируем.
-        elif call_count == 2:
-            logging.debug("Realtime-слушатель: Пропуск второго (дублирующего) 'Initial Snapshot'.")
-            return
-
-        # 3. ВСЕ ПОСЛЕДУЮЩИЕ ВЫЗОВЫ (Realtime Changes) - принимаем.
-        else:
-            reason = "ФАКТИЧЕСКОЕ ИЗМЕНЕНИЕ"
-            logging.info(f"Обнаружено изменение в структуре гайдов ({reason}). Количество изменений: {len(changes)}. Инициирую обновление через сигнал.")
+        if changes:
+            logging.info(f"Realtime-слушатель: получено {len(changes)} изменений → debounced обновление дерева.")
             firebase_signals.guides_structure_changed.emit()
 
     try:
-        col_ref = db.collection('structure')
-        # Запуск слушателя. col_watch - это функция отписки.
-        col_watch = col_ref.on_snapshot(on_snapshot)
-        listener_running = True
-        logging.info("Слушатель структуры Firebase успешно запущен.")
-        return col_watch
-        
+        _structure_watch = db.collection('structure').on_snapshot(on_snapshot)
+        logging.info("Слушатель структуры Firebase успешно запущен (глобальный, один раз).")
+        return _structure_watch
     except Exception as e:
-        logging.error(f"Ошибка установки слушателя структуры: {e}")
-        listener_running = False
+        logging.error(f"Ошибка создания слушателя: {e}")
         return None
+
+def stop_structure_listener():
+    global _structure_watch
+    if _structure_watch is not None:
+        try:
+            _structure_watch.unsubscribe()
+            logging.info("Глобальный слушатель структуры остановлен.")
+        except Exception as e:
+            logging.error(f"Ошибка при отписке: {e}")
+        finally:
+            _structure_watch = None

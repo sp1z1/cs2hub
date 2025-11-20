@@ -1,390 +1,545 @@
 # views/tree_handler.py
 import logging
-from typing import TYPE_CHECKING
-from PyQt6.QtWidgets import QMenu, QInputDialog, QMessageBox, QTreeWidgetItem
-from PyQt6.QtCore import Qt, QPoint, QTimer # QTimer импортирован, но не используется в оптимизированном D&D
-from PyQt6.QtGui import QIcon, QAction
+from typing import TYPE_CHECKING, Optional, List, Dict 
+
+from PyQt6.QtWidgets import (
+    QMenu, QInputDialog, QMessageBox, 
+    QDialog, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton, QLabel, QListView 
+)
+from PyQt6.QtCore import Qt, QPoint, QTimer, QModelIndex
+from PyQt6.QtGui import QStandardItem
 import qtawesome as qta
 
 from config import DEFAULT_GUIDE_CONTENT
+# 🚀 ИСПРАВЛЕНО: Добавлен импорт 'db' для Drag-and-Drop
 from core.firebase_service import (
-    get_structure_metadata, get_all_guides_for_search_new,
-    create_new_node, rename_node, delete_node_recursively,
-    start_structure_listener, listener_running, update_node_metadata, update_node_order
+    get_structure_metadata, create_new_node, rename_node,
+    delete_node_recursively, start_structure_listener,
+    get_all_guides_for_search_new,
+    update_structure_after_drag_and_drop
 )
-from core.signals import FirebaseSignals
-from views.custom_widgets import CustomTreeWidget
+from core.firebase_service import firebase_signals, start_structure_listener, stop_structure_listener
+from views.custom_tree_view import CustomTreeView
 
 if TYPE_CHECKING:
     from views.main_window import MainWindow
 
+
+ICON_CHOICES: Dict[str, List[tuple]] = {
+    'guide': [
+        ("fa5s.users", "#50E3C2"),    # Бирюзовый
+        ("fa5s.stream", "#9B59B6"),   # Фиолетовый
+        ("fa5s.book-open", "#F5A623"),# Оранжевый
+        ("mdi6.strategy", "#54D051"), # Ярко-зеленый
+        ("ri.list-settings-line", "#E777A3"), # Розовый
+        ("fa5s.file-alt", "#A9B7C6"), # Нейтральный Серый
+    ],
+    'folder': [
+        # Структура, Файлы
+        ("fa5s.folder-open", "#F8E71C"),     # Желтый (Классическая папка)
+        ("fa5s.map-marked-alt", "#4A90E2"),  # Синий (Карта)
+        ("fa5s.sitemap", "#50E3C2"),         # Бирюзовый (Структура)
+    ]
+}
+# Иконки по умолчанию для новых элементов
+DEFAULT_GUIDE_ICON = ICON_CHOICES['guide'][0]
+DEFAULT_FOLDER_ICON = ICON_CHOICES['folder'][0]
+
+# ==================== КАСТОМНЫЙ ДИАЛОГ ВЫБОРА ИКОНКИ (Визуальное отображение) ====================
+class IconSelectionDialog(QDialog):
+    """Кастомный диалог с QComboBox для визуального выбора Qtawesome иконки."""
+    def __init__(self, node_type: str, current_icon_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Выбор иконки")
+        self.setFixedSize(300, 150)
+        
+        self.choices = ICON_CHOICES.get(node_type, [])
+        self.selected_icon_name = None
+
+        main_layout = QVBoxLayout(self)
+
+        # 1. ComboBox для выбора
+        self.icon_combo = QComboBox(self)
+        self.icon_combo.setView(QListView()) # Улучшает отображение элементов
+        self.icon_combo.setIconSize(self.icon_combo.iconSize() * 1.5) # Немного увеличим иконки
+
+        default_index = 0
+        
+        for i, (name, color) in enumerate(self.choices):
+            # name теперь гарантированно является рабочим именем иконки
+            icon = qta.icon(name, color=color) 
+            # Используем QIcon в addItem(), чтобы QComboBox отобразил иконку
+            self.icon_combo.addItem(icon, name) 
+            
+            if name == current_icon_name:
+                default_index = i
+        
+        self.icon_combo.setCurrentIndex(default_index)
+
+        main_layout.addWidget(QLabel("Выберите иконку:"))
+        main_layout.addWidget(self.icon_combo)
+
+        # 2. Кнопки
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("ОК")
+        btn_cancel = QPushButton("Отмена")
+        
+        btn_ok.clicked.connect(self._accept_selection)
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_ok)
+        main_layout.addLayout(btn_layout)
+
+    def _accept_selection(self):
+        # Получаем выбранное имя иконки, которое мы сохранили как текст элемента
+        self.selected_icon_name = self.icon_combo.currentText()
+        self.accept()
+
+    @staticmethod
+    def getIconChoice(node_type: str, current_icon_name: str, parent=None) -> Optional[str]:
+        """Статический метод для запуска диалога и получения результата."""
+        dialog = IconSelectionDialog(node_type, current_icon_name, parent)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            return dialog.selected_icon_name
+        return None
+
+# ==================== MIXIN ОБРАБОТЧИКА ДЕРЕВА ====================
 class TreeHandlerMixin:
-    """Mixin для обработки дерева структуры гайдов."""
+    """Mixin для работы с деревом на QTreeView + QStandardItemModel"""
+    
+    # ⚠️ ПРЕДПОЛАГАЕТСЯ: В РЕАЛЬНОМ ПРИЛОЖЕНИИ ЭТА ПЕРЕМЕННАЯ УСТАНАВЛИВАЕТСЯ ПРИ АУТЕНТИФИКАЦИИ
+    def __init__(self):
+        super().__init__()
+        # 🛑 ЗАГЛУШКА: Установите True для администратора, False для обычного пользователя.
+        self.is_editable = True 
 
     def init_tree(self):
-        """Инициализация компонентов, связанных с деревом."""
-        self.tree = CustomTreeWidget(handler=self)
-        # self.is_handling_local_dnd = False <-- УДАЛЕНО: Больше не нужен
+        self.tree = CustomTreeView(handler=self)
         self.guide_map = {}
         self.search_cache = {}
-        self.tree.setDragEnabled(True)
-        self.tree.setAcceptDrops(True)
-        self.tree.setDropIndicatorShown(True)
-        self.tree.setDragDropMode(self.tree.DragDropMode.InternalMove)
-        self.tree.setSelectionMode(self.tree.SelectionMode.SingleSelection)
-        """Инициализация сигнального объекта"""
-        self.firebase_signals = FirebaseSignals()
-        """Переменная для хранения функции отписки"""
+        self.is_searching = False # Флаг для режима поиска
+
+        self.firebase_signals = firebase_signals
         self.unsubscribe_structure_listener = None
-        """ПРЕДОТВРАЩЕНИЕ ПОВТОРНОГО ЗАПУСКА"""
-        self._listener_started = False
-        """Подключение сигнала Realtime Listener к слоту обновления"""
         self.firebase_signals.guides_structure_changed.connect(self._handle_structure_update)
-        # --- ОПТИМИЗАЦИЯ: Таймер для Debouncing ---
+
+        # 1. Таймер для Realtime Listener (Debounce)
         self.repopulate_timer = QTimer(self.tree)
         self.repopulate_timer.setSingleShot(True)
-        # Устанавливаем задержку, например, 200 мс. Это время "тишины" между обновлениями.
-        self.repopulate_timer.setInterval(200) 
-        self.repopulate_timer.timeout.connect(lambda: self.repopulate_tree("DEBOUNCED_UPDATE"))
-        # --- КОНЕЦ: Таймер для Debouncing ---
+        self.repopulate_timer.setInterval(300)
+        self.repopulate_timer.timeout.connect(self.populate_tree)
 
-    """Новый слот для обработки сигнала"""
-    def _handle_structure_update(self):
-        """Слот для обработки сигнала об изменении структуры гайдов из Firestore."""
-        # Listener всегда вызывает repopulate_tree, даже после D&D
-        self.repopulate_tree("REALTIME_UPDATE")
-        self.repopulate_timer.start()
-
-    """Новый метод для запуска слушателя"""
-    def start_realtime_listeners(self):
-        """Запуск слушателя изменений в коллекции 'structure'."""
-        if not self.unsubscribe_structure_listener:
-            # Вызываем функцию из firebase_service для запуска слушателя
-            self.unsubscribe_structure_listener = start_structure_listener(self.firebase_signals)
-
-    """Остановка слушателя Firebase при закрытии приложения."""
-    def stop_realtime_listeners(self):
-        global listener_running
-        if self.unsubscribe_structure_listener:
-            self.unsubscribe_structure_listener()
-            self.unsubscribe_structure_listener = None
-            logging.info("Слушатель структуры Firebase остановлен.")
-            listener_running = False
-            
-    """Заполняет дерево гайдов на основе метаданных структуры из Firestore."""
-    def populate_tree(self, reason: str = "ЗАПУCК ПРИЛОЖЕНИЯ У ПОЛЬЗОВАТЕЛЯ."):
-            """
-            Заполняет дерево гайдов, используя рекурсивный подход, 
-            сохраняя и восстанавливая состояние развертывания и выбора.
-            """
-            
-            # --- ОПТИМИЗАЦИЯ: Сохранение состояния ---
-            expanded_ids = {item.data(0, Qt.ItemDataRole.UserRole) 
-                            for item in self.tree.findItems("", Qt.MatchFlag.MatchRecursive) 
-                            if item.isExpanded() and item.data(0, Qt.ItemDataRole.UserRole)}
-            selected_id = self.tree.currentItem().data(0, Qt.ItemDataRole.UserRole) if self.tree.currentItem() else None
-            # --- КОНЕЦ: Сохранение состояния ---
-            
-            self.tree.clear()
-            self.guide_map.clear()
-
-            nodes = get_structure_metadata()
-            if not nodes:
-                logging.warning("Не удалось загрузить структуру гайдов.")
-                return
-
-            # 1. Создаем список всех действительных ID узлов для проверки
-            valid_node_ids = {node['id'] for node in nodes}
-            
-            # 2. Сгруппировать узлы по parent_id, отфильтровывая циклические/несуществующие ссылки
-            nodes_by_parent = {}
-            
-            for node in nodes:
-                node_id = node['id']
-                parent_id = node.get('parent_id')
-                
-                # Проверка 1: Циклическая зависимость (узел родитель самому себе)
-                if parent_id == node_id:
-                    logging.error(f"Обнаружен циклический узел (родитель = сам себе): {node_id}. Добавляется как корневой.")
-                    parent_id = None
-                
-                # Проверка 2: Родитель не существует в текущем наборе узлов
-                elif parent_id is not None and parent_id not in valid_node_ids:
-                    logging.warning(f"Родитель {parent_id} не найден для узла {node_id}. Добавляется как корневой.")
-                    parent_id = None
-
-                if parent_id not in nodes_by_parent:
-                    nodes_by_parent[parent_id] = []
-                nodes_by_parent[parent_id].append(node)
-                
-            # 3. Рекурсивная функция для построения элементов
-            def build_tree_items(parent_id: str | None, parent_widget=None):
-                children = nodes_by_parent.get(parent_id) or []
-                
-                # ИЗМЕНЕНИЕ: Сортировка только по полю 'order'
-                sorted_children = sorted(children, key=lambda node: node.get('order', 0))
-
-                for node in sorted_children:
-                    item = QTreeWidgetItem([node['name']])
-                    item.setData(0, Qt.ItemDataRole.UserRole, node['id'])
-                    item.setData(0, Qt.ItemDataRole.UserRole + 1, node['type'])
-                    
-                    self.guide_map[node['id']] = node['name']
-                    
-                    icon = qta.icon("fa5s.file-alt", color="#e0e0e0") if node['type'] == 'guide' else qta.icon("fa5s.folder", color="#ffd700")
-                    item.setIcon(0, icon)
-                    
-                    if self.is_editable:
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-
-                    if parent_widget is None:
-                        self.tree.addTopLevelItem(item)
-                    else:
-                        parent_widget.addChild(item)
-                    
-                    # --- ОПТИМИЗАЦИЯ: Восстановление состояния (Expand) ---
-                    if node['id'] in expanded_ids:
-                        item.setExpanded(True)
-                    # --- КОНЕЦ: Восстановление состояния ---
-                    
-                    build_tree_items(node['id'], item)
-
-            # 4. Запуск построения дерева с корневого уровня (None)
-            build_tree_items(None)
-
-            # self.tree.expandAll() <-- УДАЛЕНО: Расширяем только сохраненные узлы
-            
-            # --- ОПТИМИЗАЦИЯ: Восстановление выбора ---
-            if selected_id:
-                # Ищем элемент по ID
-                items = self.tree.findItems(selected_id, Qt.MatchFlag.MatchRecursive, column=0)
-                if items:
-                    self.tree.setCurrentItem(items[0])
-            # --- КОНЕЦ: Восстановление выбора ---
-
-            self.search_cache = get_all_guides_for_search_new()
-            
-    def repopulate_tree(self,reason: str = "ОБЩЕЕ ОБНОВЛЕНИЕ У ПОЛЬЗОВАТЕЛЕЙ."):
-        """Перезагружает дерево и обновляет текущий гайд."""
-        self.populate_tree(reason )
-        if self.current_guide_fn:
-            self.load_guide_by_node_id(self.current_guide_fn)
-
-    def on_tree_item_clicked(self, item: QTreeWidgetItem, column: int):
-        """Обрабатывает клик по элементу дерева."""
-        node_id = item.data(0, Qt.ItemDataRole.UserRole)
-        node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
-        if node_type == 'guide':
-            self.load_guide_by_node_id(node_id)
-
-    def on_tree_item_double_clicked(self, item: QTreeWidgetItem, column: int):
-        """Обрабатывает двойной клик по элементу дерева (переименование для редакторов)."""
-        if self.is_editable:
-            self.tree.editItem(item, column)
-
-    def search_guides(self, query: str):
-        """Ищет гайды по тексту в заголовках и контенте."""
-        if not query.strip():
-            self.tree.clearSelection()
-            return
-
-        query_lower = query.lower()
-        found_items = []
-
-        for item in self.tree.findItems("", Qt.MatchFlag.MatchRecursive | Qt.MatchFlag.MatchContains):
-            node_id = item.data(0, Qt.ItemDataRole.UserRole)
-            if not node_id: continue
-
-            title = self.guide_map.get(node_id, "").lower()
-            content = self.search_cache.get(node_id, {}).get('content', "").lower()
-
-            if query_lower in title or query_lower in content:
-                found_items.append(item)
-
-        self.tree.clearSelection()
-        for item in found_items:
-            item.setSelected(True)
-            parent = item.parent()
-            while parent:
-                parent.setExpanded(True)
-                parent = parent.parent()
-
-    def highlight_search_results(self):
-        """Подсвечивает результаты поиска в webview (если применимо)."""
-        # Логика подсветки может быть добавлена позже
-        pass
-
-    def show_context_menu(self, position: QPoint):
-        """Показывает контекстное меню для дерева."""
-        menu = QMenu()
-
-        item = self.tree.itemAt(position)
-
-        # 1. Сценарий: Нажатие на пустое место
-        if not item:
-            root_id = None 
-            
-            if self.is_editable: # <--- Добавляем проверку прав только здесь
-                add_guide_action = QAction(qta.icon("fa5s.file-alt", color="#e0e0e0"), "Добавить гайд", self)
-                add_guide_action.triggered.connect(lambda: self.add_new_guide(root_id))
-                menu.addAction(add_guide_action)
-
-                add_folder_action = QAction(qta.icon("fa5s.folder-plus", color="#ffd700"), "Добавить папку", self)
-                add_folder_action.triggered.connect(lambda: self.add_new_folder(root_id))
-                menu.addAction(add_folder_action)
-
-            # Показываем меню и завершаем выполнение функции
-            menu.exec(self.tree.viewport().mapToGlobal(position))
-            return # <-- Обязательно выходим, независимо от is_editable
-
-        # Дальнейший код выполняется только если был нажат элемент (item is not None)
+        # 2. Таймер для поля поиска (Debounce)
+        self.search_timer = QTimer(self.tree) 
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(300)
+        self.search_timer.timeout.connect(self.perform_search)
         
-        # Проверка редактируемости должна быть в начале этого блока
-        if not self.is_editable: 
-            # Для нередактируемых пользователей на элементе, показываем пустое меню (или с общими действиями, если есть)
-            menu.exec(self.tree.viewport().mapToGlobal(position))
+    def perform_search(self):
+        # ⚠️ ПРЕДПОЛАГАЕТСЯ: self.search_input существует в основном классе
+        query = self.search_input.text().strip()
+        
+        if not query:
+            if self.is_searching:
+                self.is_searching = False
+                self.populate_tree() 
+            return
+            
+        self.is_searching = True
+        logging.info(f"Выполняется поиск по запросу: {query}")
+        
+        if not self.search_cache:
+            self.search_cache = get_all_guides_for_search_new()
+            logging.info(f"Кэш поиска загружен: {len(self.search_cache)} гайдов.")
+
+        results = {}
+        for node_id, data in self.search_cache.items():
+            if query.lower() in data['title'].lower() or query.lower() in data['content'].lower():
+                results[node_id] = data
+
+        self.populate_tree_search(results)
+
+    def populate_tree_search(self, results: dict):
+        """Отображает результаты поиска в виде плоского списка."""
+        self.tree.model.clear()
+        
+        if not results:
+            item = QStandardItem("Ничего не найдено")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.tree.model.appendRow(item)
             return
 
-        # Если is_editable == True (редактор) и item is not None
-        node_id = item.data(0, Qt.ItemDataRole.UserRole)
-        node_type = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        for node_id, data in results.items():
+            item = QStandardItem(data['title'])
+            item.setData(node_id, Qt.ItemDataRole.UserRole)
+            item.setData('guide', Qt.ItemDataRole.UserRole + 1)
+            # 💡 Использование иконки по умолчанию из новых констант
+            icon = qta.icon(DEFAULT_GUIDE_ICON[0], color=DEFAULT_GUIDE_ICON[1])
+            item.setIcon(icon)
+            # Отключаем D&D и редактирование в поиске
+            item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsDropEnabled | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsEditable)) 
+            self.tree.model.appendRow(item)
 
-        # 2. Сценарий: Нажатие на папку (редактор)
-        if node_type == 'folder':
-            add_guide_action = QAction(qta.icon("fa5s.file-alt", color="#e0e0e0"), "Добавить гайд", self)
-            add_guide_action.triggered.connect(lambda: self.add_new_guide(node_id))
-            menu.addAction(add_guide_action)
 
-            add_folder_action = QAction(qta.icon("fa5s.folder-plus", color="#ffd700"), "Добавить папку", self)
-            add_folder_action.triggered.connect(lambda: self.add_new_folder(node_id))
-            menu.addAction(add_folder_action)
+    def _handle_structure_update(self):
+        if not self.is_searching: 
+            self.repopulate_timer.start()
 
-        # 3. Сценарий: Нажатие на любой редактируемый элемент (папку или гайд)
+    def start_realtime_listeners(self):
+        self.unsubscribe_structure_listener = start_structure_listener()
+
+    def stop_realtime_listeners(self):
+        try:
+            firebase_signals.guides_structure_changed.disconnect(self._handle_structure_update)
+        except:
+            pass
+        stop_structure_listener()
+        self.unsubscribe_structure_listener = None
+
+    # ==================== КЛИКИ ПО ДЕРЕВУ ====================
+    def on_tree_item_clicked(self, index: QModelIndex):
+        if not index.isValid():
+            return
+        item = self.tree.model.itemFromIndex(index)
+        if not item:
+            return
+        node_id = item.data(Qt.ItemDataRole.UserRole)
+        node_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        if node_type == "guide" and node_id:
+            # ⚠️ ПРЕДПОЛАГАЕТСЯ: self.load_guide_by_node_id существует
+            self.load_guide_by_node_id(node_id) 
+            
+
+    def on_tree_item_double_clicked(self, index: QModelIndex):
+        if not index.isValid():
+            return
+        item = self.tree.model.itemFromIndex(index)
+        if not item:
+            return
+        node_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        if node_type == "folder":
+            self.tree.setExpanded(index, not self.tree.isExpanded(index))
+        elif node_type == "guide":
+            node_id = item.data(Qt.ItemDataRole.UserRole)
+            if node_id:
+                # ⚠️ ПРЕДПОЛАГАЕТСЯ: self.load_guide_by_node_id существует
+                self.load_guide_by_node_id(node_id)
+                
+
+
+    # ==================== КОНТЕКСТНОЕ МЕНЮ ====================
+    def show_context_menu(self, position: QPoint):
+        if self.is_searching:
+            return
+
+        index = self.tree.indexAt(position)
+        item = self.tree.model.itemFromIndex(index) if index.isValid() else None
+        
+        node_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        node_type = item.data(Qt.ItemDataRole.UserRole + 1) if item else None
+        
+        # Определяем родителя для добавления
+        target_id_for_add = None
+        if node_type == "folder":
+            target_id_for_add = node_id
+        elif node_type == "guide":
+            parent_index = index.parent()
+            parent_item = self.tree.model.itemFromIndex(parent_index) if parent_index.isValid() else None
+            target_id_for_add = parent_item.data(Qt.ItemDataRole.UserRole) if parent_item else None
+        elif not item:
+             target_id_for_add = None
+        
+        menu = QMenu(self.tree)
+
+        # 🛑 Контроль доступа: Добавление
+        if self.is_editable and (target_id_for_add is not None or not index.isValid()):
+            # 💡 Использование иконки по умолчанию из новых констант
+            add_guide_action = menu.addAction(qta.icon(DEFAULT_GUIDE_ICON[0], color=DEFAULT_GUIDE_ICON[1]), "Добавить гайд")
+            add_guide_action.triggered.connect(lambda: self.add_new_guide(target_id_for_add))
+
+            # 💡 Использование иконки по умолчанию из новых констант
+            add_folder_action = menu.addAction(qta.icon(DEFAULT_FOLDER_ICON[0], color=DEFAULT_FOLDER_ICON[1]), "Добавить папку")
+            add_folder_action.triggered.connect(lambda: self.add_new_folder(target_id_for_add))
+            
+            if node_id not in ['root_info', 'folder_maps', 'root_settings']:
+                menu.addSeparator()
+
+        # 🛑 Контроль доступа: Переименование/Удаление
+        if item and self.is_editable and node_id and node_id not in ['root_info', 'folder_maps', 'root_settings']:
+            # 💡 Изменено: Переименование теперь включает выбор иконки
+            rename_action = menu.addAction(qta.icon("fa5s.edit", color="#e0e0e0"), "Переименовать и сменить иконку")
+            rename_action.triggered.connect(lambda: self.rename_node_and_icon_dialog(node_id, item.text(), node_type))
+
+            delete_action = menu.addAction(qta.icon("fa5s.trash-alt", color="#ff6b6b"), "Удалить")
+            delete_action.triggered.connect(lambda: self.delete_node_dialog(node_id, item.text()))
+
         if menu.actions():
-            menu.addSeparator() # Добавляем разделитель, если уже есть действия
+            menu.exec(self.tree.viewport().mapToGlobal(position))
 
-        rename_action = QAction(qta.icon("fa5s.edit", color="#e0e0e0"), "Переименовать", self)
-        rename_action.triggered.connect(lambda: self.rename_node_dialog(node_id, item.text(0)))
-        menu.addAction(rename_action)
+    # 🚀 ИСПРАВЛЕНО: Теперь вызывает IconSelectionDialog и передает icon_name
+    def add_new_guide(self, parent_id: Optional[str]):
+        # 🛑 Проверка прав
+        if not self.is_editable:
+            QMessageBox.warning(self, "Ошибка доступа", "Недостаточно прав для создания гайда.")
+            return
 
-        delete_action = QAction(qta.icon("fa5s.trash-alt", color="#ff6b6b"), "Удалить", self)
-        delete_action.triggered.connect(lambda: self.delete_node_dialog(node_id, item.text(0)))
-        menu.addAction(delete_action)
-
-        menu.exec(self.tree.viewport().mapToGlobal(position))
-
-    def add_new_guide(self, parent_id: str):
-        """Добавляет новый гайд в указанную папку."""
         name, ok = QInputDialog.getText(self, "Новый гайд", "Введите название гайда:")
         if ok and name.strip():
-            new_id = create_new_node(name.strip(), parent_id, 'guide', DEFAULT_GUIDE_CONTENT(name.strip()))
-            if new_id:
-                # Теперь полагаемся на Listener, который вызовет repopulate_tree
-                logging.info(f"Запрос на добавление гайда '{name.strip()}' отправлен в Firestore.")
-            else:
-                QMessageBox.critical(self, "Ошибка", "Не удалось создать гайд.")
+            # 💡 Вызываем кастомный диалог с визуальным выбором
+            icon_name = IconSelectionDialog.getIconChoice('guide', DEFAULT_GUIDE_ICON[0], parent=self.tree)
+            if icon_name:
+                create_new_node(name.strip(), parent_id, 'guide', DEFAULT_GUIDE_CONTENT(name.strip()), icon_name=icon_name)
 
-    def add_new_folder(self, parent_id: str):
-        """Добавляет новую папку в указанную папку."""
-        name, ok = QInputDialog.getText(self, "Новая папка", "Введите название папки:")
-        if ok and name.strip():
-            new_id = create_new_node(name.strip(), parent_id, 'folder')
-            if new_id:
-                # Теперь полагаемся на Listener, который вызовет repopulate_tree
-                logging.info(f"Запрос на добавление папки '{name.strip()}' отправлен в Firestore.")
-            else:
-                QMessageBox.critical(self, "Ошибка", "Не удалось создать папку.")
-
-    def rename_node_dialog(self, node_id: str, old_name: str):
-        """Диалог переименования узла."""
-        if node_id in ['root_info', 'folder_maps', 'root_settings']:
-            QMessageBox.warning(self, "Ошибка", f"Нельзя переименовать базовый узел '{old_name}'.")
+    # 🚀 ИСПРАВЛЕНО: Теперь вызывает IconSelectionDialog и передает icon_name
+    def add_new_folder(self, parent_id: Optional[str]):
+        # 🛑 Проверка прав
+        if not self.is_editable:
+            QMessageBox.warning(self, "Ошибка доступа", "Недостаточно прав для создания папки.")
             return
 
-        new_name, ok = QInputDialog.getText(self, "Переименовать", "Новое название:", text=old_name)
-        if ok and new_name.strip() and new_name != old_name:
-            if rename_node(node_id, new_name.strip()):
-                QMessageBox.information(self, "Успех", f"Узел '{old_name}' переименован в '{new_name.strip()}'")
-                # Теперь полагаемся на Listener, который вызовет repopulate_tree
+        name, ok = QInputDialog.getText(self, "Новая папка", "Введите название папки:")
+        if ok and name.strip():
+            # 💡 Вызываем кастомный диалог с визуальным выбором
+            icon_name = IconSelectionDialog.getIconChoice('folder', DEFAULT_FOLDER_ICON[0], parent=self.tree)
+            if icon_name:
+                 create_new_node(name.strip(), parent_id, 'folder', icon_name=icon_name)
+
+    # 💡 НОВОЕ: Диалог переименования с возможностью смены иконки
+    def rename_node_and_icon_dialog(self, node_id: str, old_name: str, node_type: str):
+        # 🛑 Проверка прав
+        if not self.is_editable:
+            QMessageBox.warning(self, "Ошибка доступа", "Недостаточно прав для переименования.")
+            return
+
+        # 1. Запрашиваем новое имя
+        new_name, ok_name = QInputDialog.getText(self, "Переименовать", "Новое название:", text=old_name)
+        if not ok_name or not new_name.strip():
+            return
+        
+        # 2. Запрашиваем новую иконку
+        
+        # Ищем текущее имя иконки для установки по умолчанию в диалоге
+        current_icon_name = None
+        for item_id in self.guide_map:
+            if item_id == node_id:
+                # В текущем коде у нас нет простого способа получить icon_name из item.
+                # Поэтому пока используем дефолтную иконку как заглушку.
+                # В идеале, нужно брать icon_name из данных узла, но для простоты:
+                current_icon_name = DEFAULT_GUIDE_ICON[0] if node_type == 'guide' else DEFAULT_FOLDER_ICON[0]
+                break
+
+        # 💡 Вызываем кастомный диалог с визуальным выбором
+        new_icon_name = IconSelectionDialog.getIconChoice(node_type, current_icon_name, parent=self.tree)
+
+        if new_icon_name or new_name.strip() != old_name:
+            # 🚀 ИСПРАВЛЕНО: Вызываем rename_node с новым именем и новой иконкой (если выбрана)
+            if rename_node(node_id, new_name.strip(), icon_name=new_icon_name):
+                 QMessageBox.information(self, "Успех", f"Узел переименован и/или иконка обновлена в «{new_name.strip()}»")
             else:
-                QMessageBox.critical(self, "Ошибка", "Не удалось переименовать узел.")
+                 QMessageBox.critical(self, "Ошибка", "Не удалось переименовать или сменить иконку в Firebase.")
 
-    def delete_node_dialog(self, node_id: str, name: str) -> bool:
-        """Диалог подтверждения удаления узла (рекурсивно)."""
+    def delete_node_dialog(self, node_id: str, name: str):
+        # 🛑 Проверка прав
+        if not self.is_editable:
+            QMessageBox.warning(self, "Ошибка доступа", "Недостаточно прав для удаления.")
+            return
+
         if node_id in ['root_info', 'folder_maps', 'root_settings']:
-            QMessageBox.warning(self, "Ошибка", f"Нельзя удалить базовый узел '{name}'.")
-            return False
-
-        reply = QMessageBox.question(self, "Удалить узел",
-                                     f"Удалить '{name}' и все содержимое рекурсивно?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            QMessageBox.warning(self, "Ошибка", "Нельзя удалить системный узел.")
+            return
+        reply = QMessageBox.question(
+            self, "Удалить узел",
+            f"Удалить «{name}» и всё содержимое рекурсивно?\nЭто действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
         if reply == QMessageBox.StandardButton.Yes:
             if delete_node_recursively(node_id):
-                # Теперь полагаемся на Listener, который вызовет repopulate_tree
-                QMessageBox.information(self, "Успех", f"Узел '{name}' и содержимое удалены.")
-                return True
+                QMessageBox.information(self, "Успех", f"Узел «{name}» удалён")
+                
+    # ==================== ПОСТРОЕНИЕ ДЕРЕВА ====================
+    def populate_tree(self):
+        """Строит полное дерево из метаданных Firestore."""
+        logging.info("Перестройка дерева (QTreeView + QStandardItemModel)")
+        self.is_searching = False 
+        
+        # 1. Сохраняем состояние
+        expanded_ids = set()
+        selected_id = None
+        current_index = self.tree.currentIndex()
+        if current_index.isValid():
+            item = self.tree.model.itemFromIndex(current_index)
+            if item:
+                selected_id = item.data(Qt.ItemDataRole.UserRole)
+
+        def collect_expanded(item: Optional[QStandardItem]):
+            if not item: return
+            node_id = item.data(Qt.ItemDataRole.UserRole)
+            if node_id and self.tree.isExpanded(item.index()):
+                expanded_ids.add(node_id)
+            for i in range(item.rowCount()):
+                collect_expanded(item.child(i))
+
+        root = self.tree.model.invisibleRootItem()
+        for i in range(root.rowCount()):
+            collect_expanded(root.child(i))
+
+        # 2. Очищаем и загружаем
+        self.tree.model.clear()
+        self.guide_map.clear()
+
+        nodes = get_structure_metadata()
+        if not nodes:
+            logging.warning("Не удалось загрузить структуру")
+            return
+
+        nodes_by_parent = {}
+        for node in nodes:
+            parent_key = node.get('parent_id') 
+            nodes_by_parent.setdefault(parent_key, []).append(node)
+
+        def create_item(node: dict) -> QStandardItem:
+            item = QStandardItem(node['name'])
+            item.setData(node['id'], Qt.ItemDataRole.UserRole)
+            item.setData(node['type'], Qt.ItemDataRole.UserRole + 1)
+            
+            node_type = node['type']
+            icon_name = node.get('icon_name')
+            icon_color = None
+            default_icon, default_color = DEFAULT_GUIDE_ICON if node_type == 'guide' else DEFAULT_FOLDER_ICON
+
+            if not icon_name:
+                # Если иконка не задана (старые данные), используем дефолт
+                icon_name, icon_color = default_icon, default_color
             else:
-                QMessageBox.critical(self, "Ошибка", "Не удалось удалить узел.")
-        return False
-        
-    def handle_tree_structure_change(self, moved_item: QTreeWidgetItem):
-        """
-        Обновляет метаданные Firestore после успешной операции Drag and Drop.
-        
-        Эта функция отправляет два обновления: 
-        1. Изменение родителя (parent_id) для перемещенного узла.
-        2. Изменение порядка (order) для всех братьев и сестер.
-        
-        Оба обновления вызовут Realtime Listener, который автоматически
-        перезагрузит дерево у всех пользователей (включая инициатора D&D).
-        """
-        # Флаг self.is_handling_local_dnd и сброс флага удалены.
-        moved_id = moved_item.data(0, Qt.ItemDataRole.UserRole)
-
-        # 1. Определение нового родителя (new_parent_id)
-        new_parent_widget = moved_item.parent()
-        new_parent_id = None
-        
-        if new_parent_widget:
-            # Получаем ID родителя, если он есть
-            new_parent_id = new_parent_widget.data(0, Qt.ItemDataRole.UserRole)
+                # Пытаемся найти сохраненный цвет в ICON_CHOICES
+                found_color = False
+                # Объединяем все возможные choices для поиска цвета
+                all_choices = ICON_CHOICES.get('guide', []) + ICON_CHOICES.get('folder', [])
+                for name, color in all_choices:
+                    if name == icon_name:
+                        icon_color = color
+                        found_color = True
+                        break
+                
+                # Если цвет не найден (например, системная иконка), 
+                # используем цвет по умолчанию
+                if not found_color:
+                    icon_color = default_color
             
-        # 2. Обновление родителя в базе данных
-        if update_node_metadata(moved_id, {'parent_id': new_parent_id}):
-            logging.info(f"Перемещен узел {moved_id}. Новый родитель: {new_parent_id}")
-        else:
-            logging.error(f"Не удалось обновить parent_id для узла {moved_id}.")
-
-        # 3. Обновление порядка (order) для всех братьев и сестер (по индексу)
-        
-        # Получаем виджет, содержащий перемещенные элементы
-        parent_widget_for_order = moved_item.parent() if moved_item.parent() else self.tree
-        siblings_data = []
-
-        is_root = parent_widget_for_order == self.tree
-        
-        # Определяем функции для подсчета и получения дочерних элементов
-        count_func = self.tree.topLevelItemCount if is_root else parent_widget_for_order.childCount
-        item_func = self.tree.topLevelItem if is_root else parent_widget_for_order.child
-
-        # Итерируем по всем детям в их текущем ВИЗУАЛЬНОМ порядке
-        for i in range(count_func()):
-            child_item = item_func(i)
+            # Если цвет все еще None (крайний случай), берем дефолтный
+            if icon_color is None:
+                icon_color = '#e0e0e0' 
             
-            if not child_item: continue
-
-            node_id = child_item.data(0, Qt.ItemDataRole.UserRole)
-            # Шаг 10 обеспечивает возможность добавления промежуточных элементов.
-            new_order_value = i * 10 
+            # 🔥 Защита от невалидных иконок, хранящихся в Firebase
+            try:
+                # Создаем иконку
+                icon = qta.icon(icon_name, color=icon_color)
+            except Exception as e:
+                logging.warning(f"Ошибка при загрузке иконки '{icon_name}' из БД. Используется дефолтная: {e}")
+                icon = qta.icon(default_icon, color=default_color)
             
-            siblings_data.append({
+            item.setIcon(icon)
+            
+            flags = item.flags() | Qt.ItemFlag.ItemIsDropEnabled 
+            
+            # 🛑 Контроль доступа
+            if self.is_editable:
+                flags |= Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsDragEnabled
+            else:
+                # В режиме чтения запрещаем D&D и редактирование
+                flags &= ~(Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+            
+            item.setFlags(flags)
+            return item
+
+        def build_tree(parent_item: QStandardItem, parent_id: Optional[str]):
+            children = sorted(nodes_by_parent.get(parent_id, []), key=lambda x: x.get('order', 0))
+            for node in children:
+                item = create_item(node)
+                parent_item.appendRow(item)
+                self.guide_map[node['id']] = node['name']
+                build_tree(item, node['id'])
+
+        # 3. Строим дерево, начиная с корневых элементов (parent_id=None)
+        root_item = self.tree.model.invisibleRootItem()
+        build_tree(root_item, None)
+
+        # 4. Восстанавливаем состояние
+        def restore_expanded(item: QStandardItem):
+            if not item: return
+            node_id = item.data(Qt.ItemDataRole.UserRole)
+            if node_id and node_id in expanded_ids:
+                self.tree.expand(item.index())
+            for i in range(item.rowCount()):
+                restore_expanded(item.child(i))
+
+        for i in range(root_item.rowCount()):
+            restore_expanded(root_item.child(i))
+
+        if selected_id:
+            self.select_node_by_id(selected_id)
+
+    def select_node_by_id(self, node_id: str):
+        def find_item(item: QStandardItem) -> Optional[QStandardItem]:
+            if not item: return None
+            if item.data(Qt.ItemDataRole.UserRole) == node_id:
+                return item
+            for i in range(item.rowCount()):
+                found = find_item(item.child(i))
+                if found:
+                    return found
+            return None
+
+        root = self.tree.model.invisibleRootItem()
+        for i in range(root.rowCount()):
+            found = find_item(root.child(i))
+            if found:
+                index = found.index()
+                self.tree.setCurrentIndex(index)
+                self.tree.scrollTo(index)
+                return
+
+    def handle_tree_structure_change_after_drop(self):
+        """Обрабатывает изменения parent_id и order после Drag-and-Drop."""
+        # 🛑 Контроль доступа
+        if not self.is_editable:
+            return
+
+        updates = []
+
+        # --- ВНУТРЕННЯЯ ФУНКЦИЯ ДЛЯ РЕКУРСИВНОГО СБОРА ДАННЫХ ---
+        def process_item(item: QStandardItem, parent_id: Optional[str]):
+            if not item: return
+            node_id = item.data(Qt.ItemDataRole.UserRole)
+            if not node_id: return
+            
+            # Сбор данных для обновления
+            # Order = row * 10 для запаса между элементами
+            updates.append({
                 'id': node_id,
-                'order': new_order_value, 
+                'parent_id': parent_id,
+                'order': item.row() * 10
             })
-            
-        # 4. Сохраняем новый порядок в базу данных
-        if update_node_order(siblings_data):
-            logging.info(f"Обновлен порядок для {len(siblings_data)} узлов (братьев/сестер {new_parent_id}).")
-        else:
-            logging.error("Не удалось обновить порядок узлов в Firebase.")
-            
+
+            # Рекурсия
+            next_parent_id = node_id
+            for row in range(item.rowCount()):
+                process_item(item.child(row), next_parent_id)
+        # -----------------------------------------------------
+
+        # 1. Запуск сбора данных от корня
+        root = self.tree.model.invisibleRootItem()
+        for i in range(root.rowCount()):
+            process_item(root.child(i), None)
+
+        # 2. Передача данных в сервис Firebase для пакетной записи
+        if updates:
+            if update_structure_after_drag_and_drop(updates):
+                logging.info("Структура успешно сохранена после drag-and-drop")
+                # Обновляем дерево из облака, чтобы восстановить его состояние
+                self.populate_tree() 
+            else:
+                # Если произошла ошибка в Firebase, выводим сообщение и восстанавливаем старую структуру
+                QMessageBox.critical(self, "Ошибка", "Не удалось сохранить порядок элементов. Проверьте подключение к Firebase.")
+                self.populate_tree()

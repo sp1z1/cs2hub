@@ -2,3 +2,4 @@ firebase_creds.json
 /data/logs/app.log
 /data
 *.log
+data/logs/app.log
